@@ -28,56 +28,51 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 if (not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID) and os.path.exists("telegram.json"):
     try:
         with open("telegram.json", "r") as f:
-            tcfg = json.load(f)
+                tcfg = json.load(f)
         TELEGRAM_BOT_TOKEN = str(tcfg.get("bot_token", "")).strip()
         TELEGRAM_CHAT_ID = str(tcfg.get("chat_id", "")).strip()
     except:
         pass
 
-TELEGRAM_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage" if TELEGRAM_BOT_TOKEN else f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN[:20]}/sendMessage"
+TELEGRAM_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage" if TELEGRAM_BOT_TOKEN else None
 
 
-def escape_markdown(text: str) -> str:
-    for char in ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}']:
-        text = text.replace(char, "\\")
-        return text
+def escape_html(text: str) -> str:
+    """Escape special characters for HTML parse_mode."""
+    return (text
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&quot;"))
 
 
-def send_telegram(msg: str) -> None:
-    """Send message to Telegram. Called on EVERY game."""
-    print(f"[DEBUG] Telegram bot configured: {bool(TELEGRAM_BOT_TOKEN)}")
-    print(f"[DEBUG] Telegram chat_id configured: {bool(TELEGRAM_CHAT_ID)}")
-    print(f"[DEBUG] Telegram URL set: {bool(TELEGRAM_URL)}")
-    print(f"[DEBUG] Message length: {len(msg)}")
-
+def send_telegram(msg: str) -> bool:
+    """Send message to Telegram. Returns True on success."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID or not TELEGRAM_URL:
         print("[!] Telegram disabled: missing credentials")
-        print("[DEBUG] Skipping Telegram send")
-        return
+        return False
 
     try:
-        print("[DEBUG] Sending POST request to Telegram API...")
-        print(f"[DEBUG] URL: {TELEGRAM_URL[:80]}...")
         resp = requests.post(
             TELEGRAM_URL,
             json={
                 "chat_id": TELEGRAM_CHAT_ID,
                 "text": msg,
-                "parse_mode": "Markdown",
+                "parse_mode": "HTML",
                 "disable_web_page_preview": True,
             },
             timeout=10,
         )
 
-        print(f"[DEBUG] Response status code: {resp.status_code}")
-        print(f"[DEBUG] Response text (first 200 chars): {resp.text[:200] if resp.text else 'No response'}")
-
         if resp.status_code != 200:
             print(f"[!] Telegram HTTP {resp.status_code}: {resp.text[:300]}")
+            return False
         else:
             print("[OK] Telegram message sent successfully.")
+            return True
     except Exception as e:
         print(f"[!] Telegram failed: {e}")
+        return False
 
 
 def load_games(tail_games: int = 800):
@@ -118,6 +113,15 @@ def load_games(tail_games: int = 800):
         print(f"[!] Error loading {GAMES_CSV}: {e}")
 
     return games
+
+
+def _get_actual_game_by_id(base_game_id: int):
+    """Get actual game data by game ID (base_game_id format)."""
+    games = load_games(tail_games=1000)
+    for g in games:
+        if g["id"] == base_game_id:
+            return g
+    return None
 
 
 def build_corr_from_games(games, lookback=250):
@@ -304,7 +308,7 @@ def make_ensemble(std_data, smart_data, corr):
 
 
 def run_scoring_workflow():
-    print("--- SCORING (TSR) ---")
+    print("--- SCORING (CAZ) ---")
 
     games = load_games()
     if not games:
@@ -324,6 +328,7 @@ def run_scoring_workflow():
     if ensemble_data:
         write_json(PRED_FILE_ENSEMBLE, ensemble_data)
 
+    # Load active predictions
     active_preds = []
     if os.path.exists(ACTIVE_PREDICTIONS_FILE):
         try:
@@ -343,6 +348,8 @@ def run_scoring_workflow():
     register("Smart", smart_data)
     register("Ensemble", ensemble_data)
 
+    # Score pending predictions
+    scored_something = False
     for pred in active_preds:
         try:
             start_id = int(pred.get("start_game_id"))
@@ -379,13 +386,16 @@ def run_scoring_workflow():
 
             record_score(latest_game["timestamp"], str(pred.get("model", "Unknown")), style, pick_size, hits, hit_numbers)
             pred["results"].append({"game_id": latest_id, "style": style, "hits": hits, "pick_size": pick_size, "hit_numbers": hit_numbers})
+            scored_something = True
 
+    # Clean up old predictions (keep pending and recently scored)
     active_preds = [
         p
         for p in active_preds
         if isinstance(p, dict)
         and "start_game_id" in p
         and calc_game_age(int(p["start_game_id"]), latest_id) <= TRACKING_DURATION
+        or calc_game_age(int(p["start_game_id"]), latest_id) > 500  # Keep future predictions
     ]
 
     try:
@@ -445,8 +455,8 @@ def run_scoring_workflow():
     # TELEGRAM: ALWAYS send on every game
     # ========================================
     msg = []
-    msg.append(f"📢 *TSR RESULT: #{latest_id}*")
-    msg.append(f"{escape_markdown(latest_game['timestamp'])}")
+    msg.append(f"<b>📢 CAZ RESULT: #{latest_id}</b>")
+    msg.append(f"{escape_html(latest_game['timestamp'])}")
 
     drawn_str = ", ".join(str(n) for n in sorted(latest_game['numbers']))
     msg.append(f"Drawn: {drawn_str}")
@@ -461,17 +471,17 @@ def run_scoring_workflow():
             r = next((x for x in p.get("results", []) if x.get("game_id") == latest_id and x.get("style") == style), None)
             if r:
                 hit_str = ", ".join(str(n) for n in r.get('hit_numbers', []))
-                lines.append(f"✅ {model_name} {style}: {r.get('hits', 0)}/{r.get('pick_size', 0)} -> {hit_str}")
+                lines.append(f"✅ {model_name} {style}: {r.get('hits', 0)}/{r.get('pick_size', 0)} → {hit_str}")
 
     if lines:
         msg.append("")
         msg.extend(lines)
     else:
         msg.append("")
-        msg.append("_(No active forecasts scored)_")
+        msg.append("<i>(No active forecasts scored)</i>")
 
     msg.append("")
-    msg.append(f"🔮 *NEXT PREDICTIONS: #{target_id}*")
+    msg.append(f"<b>🔮 NEXT PREDICTIONS: #{target_id}</b>")
 
     def add_next(model_name, data):
         if not isinstance(data, dict) or "predicted_sets" not in data:
@@ -483,7 +493,7 @@ def run_scoring_workflow():
                 nums_str = ", ".join(str(n) for n in ps[style])
                 parts.append(f"{style}: {nums_str}")
         if parts:
-            msg.append(f"*{model_name}:*")
+            msg.append(f"<b>{model_name}:</b>")
             for part in parts:
                 msg.append(f"  {part}")
 

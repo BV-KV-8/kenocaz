@@ -9,3 +9,6 @@ __pycache__/
 *.json
 !requirements.txt
 !telegram.json
+!.gitignore
+*.backup.*
+*.oldformat

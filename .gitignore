@@ -1,0 +1,11 @@
+venv/
+__pycache__/
+*.pyc
+*.log
+*.keras
+*.h5
+*.pkl
+*.csv
+*.json
+!requirements.txt
+!telegram.json

@@ -1,0 +1,265 @@
+import json
+import csv
+import os
+import requests
+import statistics
+from collections import deque
+import numpy as np
+
+# --- CONFIGURATION ---
+PRED_FILE_STD = "pred_standard.json"
+PRED_FILE_SMART = "pred_smart.json"
+PRED_FILE_ENSEMBLE = "pred_ensemble.json"
+ACTIVE_PREDICTIONS_FILE = "active_predictions.json"
+SCORES_CSV = "scores.csv"
+GAMES_CSV = "games.csv"
+
+TRACKING_DURATION = 5
+
+# Expected hits for random selection
+# Expected hits = pick_size * (20/80) = pick_size/4
+EXPECTED_VALS = {10: 2.5, 5: 1.25}
+SCORE_STYLES = ("pick_3", "pick_5", "pick_8")  # focus sets
+ALSO_SCORE = ("pick_10",)  # optional compatibility
+
+CORR_LOOKBACK = 250
+
+# --- TELEGRAM (hardcoded for CAZ) ---
+TELEGRAM_BOT_TOKEN = "8014783569:AAHPEXCFjZf7WP8lvPS05OxuJz9FBRVkEgQ"
+TELEGRAM_CHAT_ID = "5457189805"
+
+TELEGRAM_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+
+def send_telegram(msg: str) -> None:
+    """Send message to Telegram. Called on EVERY game."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID or not TELEGRAM_URL:
+        print(" [!] Telegram disabled: set TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID (or telegram.json).")
+        return
+
+    try:
+        resp = requests.post(
+            TELEGRAM_URL,
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": msg,
+                "parse_mode": "Markdown",
+                "disable_web_page_preview": True,
+            },
+            timeout=10,
+        )
+
+        if resp.status_code != 200:
+            print(f"  [!] Telegram HTTP {resp.status_code}: {resp.text[:300]}")
+        else:
+            print(" [✓] Telegram message sent successfully.")
+    except Exception as e:
+        print(f"  [!] Telegram failed: {e}")
+
+
+def load_games(tail_games: int = 800):
+    """
+    Canonical games.csv:
+    draw_id,timestamp,n1,n2,n3,n4,n5,n6,n7,n8,n9,n10,n11,n12,n13,n14,n15,n16,n17,n18,n19,n20
+    """
+    games = []
+    if not os.path.exists(GAMES_CSV):
+        return games
+
+    try:
+        last_rows = deque(maxlen=tail_games)
+        with open(GAMES_CSV, "r", newline="") as f:
+            reader = csv.DictReader(f)
+            for r in reader:
+                last_rows.append(r)
+
+        for r in last_rows:
+            did_raw = r.get("draw_id", "")
+            ts_raw = r.get("timestamp", "N/A")
+            if did_raw is None or ts_raw == "N/A":
+                continue
+
+            did = str(did_raw).strip()
+            ts = str(ts_raw).strip() if ts_raw is not None else "N/A"
+
+            nums = []
+            ok = True
+            for i in range(1, 21):
+                v = r.get(f"n{i}", None)
+                if v is None or str(v).strip() == "":
+                    ok = False
+                    break
+                nums.append(int(str(v).strip()))
+
+            if not ok or len(nums) != 20:
+                continue
+
+            games.append({"id": did, "timestamp": ts, "numbers": nums})
+    except Exception as e:
+        print(f" [!] Error loading {GAMES_CSV}: {e}")
+
+    return games
+
+
+def get_next_game_id(current_id: int) -> int:
+    return 1 if current_id == 999 else current_id + 1
+
+
+def calc_game_age(start_id: int, current_id: int) -> int:
+    if current_id >= start_id:
+        return current_id - start_id + 1
+    else:
+        return (999 - start_id) + current_id + 1
+
+
+def record_score(timestamp: str, model: str, pick_size: int, hits: int, hit_numbers):
+    """Appends score to CSV and returns Diff."""
+    ensure_scores_header()
+    expected = float(EXPECTED_VALS.get(int(pick_size), pick_size / 4.0))
+    diff = float(hits) - expected
+
+    file_exists = os.path.exists(SCORES_CSV)
+
+    try:
+        with open(SCORES_CSV, "a", newline="") as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(["timestamp", "model", "style", "pick_size", "hits", "expected", "diff", "hit_numbers"])
+
+            writer.writerow([timestamp, model, style, pick_size, hits, expected, f"{diff:+.2f}", json.dumps(hit_numbers)])
+            print(f"  [+] Logged to scores.csv: {model} ({hits} hits, Diff {diff:+.2f})")
+    except Exception as e:
+        print(f"  [!] CSV Write Error: {e}")
+
+
+def get_rolling_stats(model: str, limit: int = 100) -> float:
+    if not os.path.exists(SCORES_CSV):
+        return 0.0
+
+    diffs = []
+    try:
+        with open(SCORES_CSV, "r") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get("model") == model:
+                    try:
+                        diffs.append(float(row.get("diff", "0")))
+                    except:
+                        pass
+    except:
+        return 0.0
+
+    recent = diffs[-limit:]
+    if not recent:
+        return 0.0
+    return float(statistics.mean(recent))
+
+
+def run_scoring_workflow():
+    print("--- SCORING (CAZ) ---")
+    games, active_preds = load_games()
+    if not games:
+        print("No games data.")
+        return
+
+    latest_game = games[-1]
+    latest_id = latest_game["id"]
+    target_id = get_next_game_id(latest_id)
+
+    # 1. Load New Predictions
+    std_data = {}
+    smart_data = {}
+    if os.path.exists(PRED_FILE_STD):
+        try:
+            with open(PRED_FILE_STD, "r") as f:
+                std_data = json.load(f)
+        except:
+            pass
+
+    if os.path.exists(PRED_FILE_SMART):
+        try:
+            with open(PRED_FILE_SMART, "r") as f:
+                smart_data = json.load(f)
+        except:
+            pass
+
+    # 2. Register New Predictions
+    def register(model_name: str, data: dict):
+        if "predicted_sets" in data:
+            if not any(p["start_game_id"] == target_id and p.get("model") == model_name for p in active_preds):
+                active_preds.append({
+                    "start_game_id": target_id,
+                    "model": model_name,
+                    "picks": data["predicted_sets"],
+                    "results": []
+                })
+
+    register("Standard", std_data)
+    register("Smart", smart_data)
+
+    # 3. Score Active Predictions
+    new_scores_found = False
+    for pred in active_preds:
+        age = calc_game_age(pred["start_game_id"], latest_id)
+        if 0 < age <= TRACKING_DURATION:
+            if not any(r["game_id"] == latest_id for r in pred.get("results", [])):
+                style = "pick_10" if "pick_10" in pred["picks"] else list(pred["picks"].keys())[0]
+                pick_size = int(style.replace("pick_", ""))
+
+                nums = pred["picks"][style]
+                actual = set(latest_game["numbers"][:20])
+
+                hits = len(set(nums).intersection(actual))
+
+                # PERSISTENT SCORING
+                record_score(latest_game["timestamp"], pred["model"], pick_size, hits, list(nums.intersection(actual)))
+
+                pred["results"].append({"game_id": latest_id, "hits": hits})
+                new_scores_found = True
+
+    # 4. Save & Cleanup
+    active_preds = [p for p in active_preds if calc_game_age(p["start_game_id"], latest_id) <= TRACKING_DURATION]
+    with open(ACTIVE_PREDICTIONS_FILE, "w") as f:
+        json.dump(active_preds, f, indent=4)
+
+    # 5. Build Report
+    msg = []
+    msg.append(f"📢 *CAZ RESULT: #{latest_id}*")
+    msg.append(f"`{latest_game['timestamp']}`")
+    msg.append("Drawn: `[{', '.join([str(n) for n in latest_game['numbers'][:10]])}, ...]`")
+
+    # Show scored results for this game
+    results_found = False
+    for pred in active_preds:
+        r = next((r for r in pred.get("results", []) if r["game_id"] == latest_id), None)
+        if r:
+            results_found = True
+            m = pred["model"]
+            h = r["hits"]
+            icon = "🔥" if h >= 5 else "✅" if h >= 4 else "❌"
+            msg.append(f"   {icon} {m}: {h}/10")
+
+    if not results_found:
+        msg.append("\n_(No active forecasts scored)_")
+
+    # Add Rolling Stats
+    avg_std = get_rolling_stats("Standard")
+    avg_smt = get_rolling_stats("Smart")
+    msg.append(f"\n📈 *Avg (Last 100)*: Std {avg_std:.2f} | Smt {avg_smt:.2f}")
+
+    msg.append("")
+    msg.append(f"🔮 *NEXT: #{target_id}*")
+
+    # Add Next Predictions
+    if "predicted_sets" in std_data:
+        nums = std_data["predicted_sets"].get("pick_10", [])
+        msg.append(f"🔹 *Std:* `{','.join([str(n) for n in nums[:5])}...`")
+
+    if "predicted_sets" in smart_data:
+        nums = smart_data["predicted_sets"].get("pick_10", [])
+        msg.append(f"🔸 *Smt:* `{','.join([str(n) for n in nums[:5])}...`")
+
+    send_telegram("\n".join(msg))
+
+
+if __name__ == "__main__":
+    run_scoring_workflow()

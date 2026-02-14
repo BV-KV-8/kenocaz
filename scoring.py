@@ -340,9 +340,18 @@ def run_scoring_workflow():
     def register(model_name: str, data: dict):
         if not isinstance(data, dict) or "predicted_sets" not in data:
             return
-        if any(p.get("start_game_id") == target_id and p.get("model") == model_name for p in active_preds):
+        # Use unique key: game_id + timestamp to handle 1-999 cycle
+        pred_key = f"{target_id}_{latest_game.get('timestamp', '')}"
+        if any(p.get("pred_key") == pred_key and p.get("model") == model_name for p in active_preds):
             return
-        active_preds.append({"start_game_id": target_id, "model": model_name, "picks": data["predicted_sets"], "results": []})
+        active_preds.append({
+            "pred_key": pred_key,
+            "game_id": target_id,
+            "timestamp": latest_game.get("timestamp", ""),
+            "model": model_name,
+            "picks": data["predicted_sets"],
+            "results": []
+        })
 
     register("Standard", std_data)
     register("Smart", smart_data)
@@ -352,7 +361,7 @@ def run_scoring_workflow():
     scored_something = False
     for pred in active_preds:
         try:
-            start_id = int(pred.get("start_game_id"))
+            start_id = int(pred.get("game_id"))
         except:
             continue
 
@@ -393,9 +402,8 @@ def run_scoring_workflow():
         p
         for p in active_preds
         if isinstance(p, dict)
-        and "start_game_id" in p
-        and calc_game_age(int(p["start_game_id"]), latest_id) <= TRACKING_DURATION
-        or calc_game_age(int(p["start_game_id"]), latest_id) > 500  # Keep future predictions
+        and "pred_key" in p
+        and ("game_id" in p or "start_game_id" in p)
     ]
 
     try:
